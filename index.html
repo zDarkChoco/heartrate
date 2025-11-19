@@ -1,0 +1,269 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Front Cam HRM</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            background-color: #000; /* Keep rest of screen dark to focus light */
+            color: white;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: flex-end; /* Push controls to bottom */
+            height: 100vh;
+            margin: 0;
+            overflow: hidden;
+        }
+
+        /* THE VIRTUAL FLASH */
+        /* This creates a bright zone at the top where the camera is */
+        .light-source {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 40%; /* Light up the top 40% of screen */
+            background-color: #ffdddd; /* Bright White-ish Red for skin penetration */
+            z-index: 1;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .instruction-overlay {
+            color: #333;
+            font-weight: bold;
+            text-align: center;
+            padding: 20px;
+            pointer-events: none;
+        }
+
+        /* UI Container at bottom */
+        .ui-container {
+            z-index: 2;
+            background-color: #121212;
+            width: 100%;
+            height: 60%;
+            border-top-left-radius: 30px;
+            border-top-right-radius: 30px;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            box-shadow: 0 -5px 20px rgba(0,0,0,0.5);
+        }
+
+        #bpmDisplay {
+            font-size: 5rem;
+            font-weight: bold;
+            font-variant-numeric: tabular-nums;
+        }
+
+        .label { font-size: 1.2rem; color: #888; margin-bottom: 20px; }
+
+        #graphCanvas {
+            width: 90%;
+            height: 60px;
+            background: #222;
+            margin-bottom: 20px;
+            border-radius: 10px;
+        }
+
+        #startButton {
+            padding: 20px 40px;
+            background-color: #ff4d4d;
+            color: white;
+            border: none;
+            border-radius: 40px;
+            font-size: 1.2rem;
+            font-weight: bold;
+            cursor: pointer;
+            box-shadow: 0 4px 15px rgba(255, 77, 77, 0.4);
+        }
+        
+        #startButton:disabled { background-color: #555; box-shadow: none;}
+
+        /* Hidden processing elements */
+        video { display: none; }
+        #processCanvas { display: none; }
+    </style>
+</head>
+<body>
+
+    <div class="light-source">
+        <div class="instruction-overlay">
+            Place finger over<br>TOP CAMERA
+        </div>
+    </div>
+
+    <div class="ui-container">
+        <div id="bpmDisplay">--</div>
+        <div class="label">BPM</div>
+        
+        <canvas id="graphCanvas"></canvas>
+
+        <button id="startButton">Start</button>
+        <p style="color: #666; font-size: 0.8rem; margin-top:10px">Set Screen Brightness to 100%</p>
+    </div>
+
+    <video id="video" playsinline></video>
+    <canvas id="processCanvas"></canvas>
+
+<script>
+    const video = document.getElementById('video');
+    const processCanvas = document.getElementById('processCanvas');
+    const processCtx = processCanvas.getContext('2d', { willReadFrequently: true });
+    const graphCanvas = document.getElementById('graphCanvas');
+    const graphCtx = graphCanvas.getContext('2d');
+    
+    const bpmDisplay = document.getElementById('bpmDisplay');
+    const startBtn = document.getElementById('startButton');
+
+    // Signal Processing Config
+    const BUFFER_SIZE = 30; 
+    const brightnessBuffer = [];
+    const recentBPMs = [];
+    let lastBeatTime = 0;
+    
+    // Graphing variables
+    const signalHistory = new Array(100).fill(0);
+
+    startBtn.addEventListener('click', async () => {
+        startBtn.disabled = true;
+        startBtn.innerText = "Calibrating...";
+        
+        try {
+            // Use 'user' for Front Camera
+            const stream = await navigator.mediaDevices.getUserMedia({
+                video: { 
+                    facingMode: 'user', 
+                    width: { ideal: 320 },
+                    height: { ideal: 240 },
+                    frameRate: { ideal: 30 }
+                }
+            });
+            
+            video.srcObject = stream;
+            await video.play();
+            
+            startBtn.innerText = "Detecting...";
+            requestAnimationFrame(processFrame);
+
+        } catch (err) {
+            alert("Camera Error: " + err.message);
+            startBtn.disabled = false;
+            startBtn.innerText = "Retry";
+        }
+    });
+
+    function processFrame() {
+        if (video.paused || video.ended) return;
+
+        // Resize hidden canvas to match video
+        if (processCanvas.width !== video.videoWidth) {
+            processCanvas.width = video.videoWidth;
+            processCanvas.height = video.videoHeight;
+        }
+
+        // Draw video frame
+        processCtx.drawImage(video, 0, 0, processCanvas.width, processCanvas.height);
+
+        // Extract center data (where the finger is)
+        const centerX = Math.floor(processCanvas.width / 2);
+        const centerY = Math.floor(processCanvas.height / 2);
+        const frameData = processCtx.getImageData(centerX - 20, centerY - 20, 40, 40);
+        const data = frameData.data;
+
+        // Calculate Green channel intensity 
+        // (Green is often better for front-cam/ambient light PPG than Red)
+        let totalIntensity = 0;
+        for (let i = 0; i < data.length; i += 4) {
+            // We use Green (data[i+1]) because it has high absorption contrast
+            // But we can mix Green and Red for stability
+            totalIntensity += data[i+1]; 
+        }
+        const avgIntensity = totalIntensity / (data.length / 4);
+
+        updateGraph(avgIntensity);
+        detectBeat(avgIntensity);
+
+        requestAnimationFrame(processFrame);
+    }
+
+    function detectBeat(value) {
+        const now = Date.now();
+
+        // Rolling Average for baseline
+        brightnessBuffer.push(value);
+        if (brightnessBuffer.length > BUFFER_SIZE) brightnessBuffer.shift();
+        const bufferAvg = brightnessBuffer.reduce((a, b) => a + b, 0) / brightnessBuffer.length;
+
+        // Since front camera light is weak, the signal change is subtle.
+        // We need a lower threshold than the back camera.
+        const THRESHOLD = 1.002; // Very sensitive
+        const MIN_BEAT_INTERVAL = 350; // Max ~170 BPM
+
+        // Invert logic: On some screens/sensors, systole (pulse) darkens the image.
+        // We look for a dip or a spike. Let's look for a significant deviation.
+        // Usually: Blood flows in -> More green absorbed -> Image gets darker (Val < Avg).
+        
+        if (value < bufferAvg / THRESHOLD && (now - lastBeatTime > MIN_BEAT_INTERVAL)) {
+             // Beat Detected
+             if (lastBeatTime > 0) {
+                const delta = now - lastBeatTime;
+                const instantaneousBpm = 60000 / delta;
+
+                if (instantaneousBpm > 45 && instantaneousBpm < 200) {
+                    recentBPMs.push(instantaneousBpm);
+                    if (recentBPMs.length > 8) recentBPMs.shift(); // smoother average
+
+                    const avgBpm = Math.round(recentBPMs.reduce((a, b) => a + b, 0) / recentBPMs.length);
+                    bpmDisplay.innerText = avgBpm;
+                    
+                    // Visual Pulse
+                    bpmDisplay.style.transform = "scale(1.2)";
+                    setTimeout(() => bpmDisplay.style.transform = "scale(1)", 100);
+                }
+            }
+            lastBeatTime = now;
+        }
+    }
+
+    function updateGraph(value) {
+        // Normalize for visualization
+        signalHistory.push(value);
+        signalHistory.shift();
+
+        const w = graphCanvas.width;
+        const h = graphCanvas.height;
+        if (graphCanvas.width !== graphCanvas.clientWidth) {
+             graphCanvas.width = graphCanvas.clientWidth;
+             graphCanvas.height = graphCanvas.clientHeight;
+        }
+
+        graphCtx.clearRect(0, 0, w, h);
+        graphCtx.strokeStyle = '#00ff00';
+        graphCtx.lineWidth = 2;
+        graphCtx.beginPath();
+
+        // Auto-scale graph
+        const min = Math.min(...signalHistory);
+        const max = Math.max(...signalHistory);
+        const range = max - min || 1;
+
+        for (let i = 0; i < signalHistory.length; i++) {
+            const x = (i / signalHistory.length) * w;
+            const normalizedY = (signalHistory[i] - min) / range; 
+            const y = h - (normalizedY * h); // Invert because canvas Y is down
+            if (i === 0) graphCtx.moveTo(x, y);
+            else graphCtx.lineTo(x, y);
+        }
+        graphCtx.stroke();
+    }
+</script>
+</body>
+</html>
+          
